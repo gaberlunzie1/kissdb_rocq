@@ -31,6 +31,18 @@ Record KISSDB := {
 
 (* ===== Hash Function (djb2) ===== *)
 
+(* Original C implementation *)
+(*
+static uint64_t KISSDB_hash(const void *b,unsigned long len)
+{
+	unsigned long i;
+	uint64_t hash = 5381;
+	for(i=0;i<len;++i)
+		hash = ((hash << 5) + hash) + (uint64_t)(((const uint8_t* )b)[i]);
+	return hash;
+}
+*)
+
 Definition djb2 (b : bytes) : nat :=
   fold_left (fun hash c => (hash * 33 + c)) b 5381.
 
@@ -38,6 +50,49 @@ Definition hash_key (db : KISSDB) (key : bytes) : nat :=
   (djb2 key) mod (hash_table_size db).
 
 (* ===== Lookup ===== *)
+
+(* Original C implementation *)
+(*
+int KISSDB_get(KISSDB *db,const void *key,void *vbuf)
+{
+	uint8_t tmp[4096];
+	const uint8_t *kptr;
+	unsigned long klen,i;
+	uint64_t hash = KISSDB_hash(key,db->key_size) % (uint64_t)db->hash_table_size;
+	uint64_t offset;
+	uint64_t *cur_hash_table;
+	long n;
+
+	cur_hash_table = db->hash_tables;
+	for(i=0;i<db->num_hash_tables;++i) {
+		offset = cur_hash_table[hash];
+		if (offset) {
+			if (fseeko(db->f,offset,SEEK_SET))
+				return KISSDB_ERROR_IO;
+
+			kptr = (const uint8_t* )key;
+			klen = db->key_size;
+			while (klen) {
+				n = (long)fread(tmp,1,(klen > sizeof(tmp)) ? sizeof(tmp) : klen,db->f);
+				if (n > 0) {
+					if (memcmp(kptr,tmp,n))
+						goto get_no_match_next_hash_table;
+					kptr += n;
+					klen -= (unsigned long)n;
+				} else return 1; /* not found */
+			}
+
+			if (fread(vbuf,db->value_size,1,db->f) == 1)
+				return 0; /* success */
+			else return KISSDB_ERROR_IO;
+		} else return 1; /* not found */
+		get_no_match_next_hash_table:
+		cur_hash_table += db->hash_table_size + 1;
+	}
+
+	return 1; /* not found */
+}
+*)
 
 (* Check if two byte sequences are equal *)
 Fixpoint bytes_eqb (a b : bytes) : bool :=
@@ -81,6 +136,114 @@ Definition kissdb_get (db : KISSDB) (key : bytes) : option bytes :=
   end.
 
 (* ===== Insert / Update ===== *)
+
+(* Original C implementation *)
+(*
+int KISSDB_put(KISSDB *db,const void *key,const void *value)
+{
+	uint8_t tmp[4096];
+	const uint8_t *kptr;
+	unsigned long klen,i;
+	uint64_t hash = KISSDB_hash(key,db->key_size) % (uint64_t)db->hash_table_size;
+	uint64_t offset;
+	uint64_t htoffset,lasthtoffset;
+	uint64_t endoffset;
+	uint64_t *cur_hash_table;
+	uint64_t *hash_tables_rea;
+	long n;
+
+	lasthtoffset = htoffset = KISSDB_HEADER_SIZE;
+	cur_hash_table = db->hash_tables;
+	for(i=0;i<db->num_hash_tables;++i) {
+		offset = cur_hash_table[hash];
+		if (offset) {
+			/* rewrite if already exists */
+			if (fseeko(db->f,offset,SEEK_SET))
+				return KISSDB_ERROR_IO;
+
+			kptr = (const uint8_t* )key;
+			klen = db->key_size;
+			while (klen) {
+				n = (long)fread(tmp,1,(klen > sizeof(tmp)) ? sizeof(tmp) : klen,db->f);
+				if (n > 0) {
+					if (memcmp(kptr,tmp,n))
+						goto put_no_match_next_hash_table;
+					kptr += n;
+					klen -= (unsigned long)n;
+				}
+			}
+
+			/* C99 spec demands seek after fread(), required for Windows */
+			fseeko(db->f,0,SEEK_CUR);
+ 
+			if (fwrite(value,db->value_size,1,db->f) == 1) {
+				fflush(db->f);
+				return 0; /* success */
+			} else return KISSDB_ERROR_IO;
+		} else {
+			/* add if an empty hash table slot is discovered */
+			if (fseeko(db->f,0,SEEK_END))
+				return KISSDB_ERROR_IO;
+			endoffset = ftello(db->f);
+
+			if (fwrite(key,db->key_size,1,db->f) != 1)
+				return KISSDB_ERROR_IO;
+			if (fwrite(value,db->value_size,1,db->f) != 1)
+				return KISSDB_ERROR_IO;
+
+			if (fseeko(db->f,htoffset + (sizeof(uint64_t) * hash),SEEK_SET))
+				return KISSDB_ERROR_IO;
+			if (fwrite(&endoffset,sizeof(uint64_t),1,db->f) != 1)
+				return KISSDB_ERROR_IO;
+			cur_hash_table[hash] = endoffset;
+
+			fflush(db->f);
+
+			return 0; /* success */
+		}
+		put_no_match_next_hash_table:
+		lasthtoffset = htoffset;
+		htoffset = cur_hash_table[db->hash_table_size];
+		cur_hash_table += (db->hash_table_size + 1);
+	}
+
+	/* if no existing slots, add a new page of hash table entries */
+	if (fseeko(db->f,0,SEEK_END))
+		return KISSDB_ERROR_IO;
+	endoffset = ftello(db->f);
+
+	hash_tables_rea = realloc(db->hash_tables,db->hash_table_size_bytes * (db->num_hash_tables + 1));
+	if (!hash_tables_rea)
+		return KISSDB_ERROR_MALLOC;
+	db->hash_tables = hash_tables_rea;
+	cur_hash_table = &(db->hash_tables[(db->hash_table_size + 1) * db->num_hash_tables]);
+	memset(cur_hash_table,0,db->hash_table_size_bytes);
+
+	cur_hash_table[hash] = endoffset + db->hash_table_size_bytes; /* where new entry will go */
+
+	if (fwrite(cur_hash_table,db->hash_table_size_bytes,1,db->f) != 1)
+		return KISSDB_ERROR_IO;
+
+	if (fwrite(key,db->key_size,1,db->f) != 1)
+		return KISSDB_ERROR_IO;
+	if (fwrite(value,db->value_size,1,db->f) != 1)
+		return KISSDB_ERROR_IO;
+
+	if (db->num_hash_tables) {
+		if (fseeko(db->f,lasthtoffset + (sizeof(uint64_t) * db->hash_table_size),SEEK_SET))
+			return KISSDB_ERROR_IO;
+		if (fwrite(&endoffset,sizeof(uint64_t),1,db->f) != 1)
+			return KISSDB_ERROR_IO;
+		db->hash_tables[((db->hash_table_size + 1) * (db->num_hash_tables - 1)) + db->hash_table_size] = endoffset;
+	}
+
+	++db->num_hash_tables;
+
+	fflush(db->f);
+
+	return 0; /* success */
+}
+*)
 
 (* Update the nth element of a list *)
 Fixpoint list_set {A} (l : list A) (n : nat) (v : A) : list A :=
@@ -135,6 +298,44 @@ Definition kissdb_put (db : KISSDB) (key value : bytes) : KISSDB :=
   end.
 
 (* ===== Iterator ===== *)
+
+(* Original C implementation *)
+(*
+void KISSDB_Iterator_init(KISSDB *db,KISSDB_Iterator *dbi)
+{
+	dbi->db = db;
+	dbi->h_no = 0;
+	dbi->h_idx = 0;
+}
+
+int KISSDB_Iterator_next(KISSDB_Iterator *dbi,void *kbuf,void *vbuf)
+{
+	uint64_t offset;
+
+	if ((dbi->h_no < dbi->db->num_hash_tables)&&(dbi->h_idx < dbi->db->hash_table_size)) {
+		while (!(offset = dbi->db->hash_tables[((dbi->db->hash_table_size + 1) * dbi->h_no) + dbi->h_idx])) {
+			if (++dbi->h_idx >= dbi->db->hash_table_size) {
+				dbi->h_idx = 0;
+				if (++dbi->h_no >= dbi->db->num_hash_tables)
+					return 0;
+			}
+		}
+		if (fseeko(dbi->db->f,offset,SEEK_SET))
+			return KISSDB_ERROR_IO;
+		if (fread(kbuf,dbi->db->key_size,1,dbi->db->f) != 1)
+			return KISSDB_ERROR_IO;
+		if (fread(vbuf,dbi->db->value_size,1,dbi->db->f) != 1)
+			return KISSDB_ERROR_IO;
+		if (++dbi->h_idx >= dbi->db->hash_table_size) {
+			dbi->h_idx = 0;
+			++dbi->h_no;
+		}
+		return 1;
+	}
+
+	return 0;
+}
+*)
 
 Record KISSDB_Iterator := {
   iter_db    : KISSDB;
