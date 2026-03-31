@@ -373,6 +373,7 @@ Definition kissdb_empty (ht_size key_sz val_sz : nat) : KISSDB :=
 
 
 (* ===== Small db for fast testing ===== *)
+(* These tests mirror those in simple-tests.c *)
 
 Definition test_db := kissdb_empty 16 2 2.
 
